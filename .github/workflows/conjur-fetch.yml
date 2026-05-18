@@ -1,0 +1,86 @@
+name: Conjur fetch (reusable)
+
+# Reusable workflow. Callers in the crosstalkis org invoke this via:
+#
+#   jobs:
+#     release:
+#       uses: crosstalkis/shared-workflows/.github/workflows/conjur-fetch.yml@v1
+#       permissions:
+#         id-token: write
+#         contents: read
+#       with:
+#         app-name: alpha
+#
+# The CALLER's repository is what shows up in the OIDC JWT's `repository` /
+# `sub` claims. The app-name input is logical-only — Conjur identifies the
+# workload by the JWT claims, not by this string.
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        type: string
+        required: true
+        description: 'Logical application identity (alpha/beta/gamma/rogue).'
+      conjur-url:
+        type: string
+        required: false
+        default: 'https://conjur-oss.conjur.svc.cluster.local'
+      conjur-account:
+        type: string
+        required: false
+        default: 'lab'
+      conjur-service-id:
+        type: string
+        required: false
+        default: 'gha'
+      conjur-audience:
+        type: string
+        required: false
+        default: 'conjur/lab'
+      secret-id:
+        type: string
+        required: false
+        default: 'lab/secrets/test-secret'
+
+jobs:
+  fetch:
+    # Matches the gha-runner-scale-set name installed in arc-runners ns.
+    runs-on: lab-runners
+    permissions:
+      id-token: write    # required so the runner exposes ACTIONS_ID_TOKEN_REQUEST_*
+      contents: read
+    steps:
+      - name: Run context
+        run: |
+          echo "App identity (logical, from caller): ${{ inputs.app-name }}"
+          echo "Caller repo (OIDC sub will reflect this): ${{ github.repository }}"
+          echo "Caller ref:  ${{ github.ref }}"
+          echo "Conjur URL:  ${{ inputs.conjur-url }}"
+          echo "Secret id:   ${{ inputs.secret-id }}"
+
+      - name: Conjur JWT exchange + secret fetch
+        id: conjur
+        # Pinned by tag — same as the reusable workflow ref. v1 moves only on
+        # intentional release. Bumping shared-workflows version is a deliberate
+        # rollout decision (matches how this'd work in ČSAS).
+        uses: crosstalkis/shared-workflows/.github/actions/conjur-jwt-fetch@v1
+        with:
+          app-name: ${{ inputs.app-name }}
+          conjur-url: ${{ inputs.conjur-url }}
+          conjur-account: ${{ inputs.conjur-account }}
+          conjur-service-id: ${{ inputs.conjur-service-id }}
+          conjur-audience: ${{ inputs.conjur-audience }}
+          secret-id: ${{ inputs.secret-id }}
+
+      - name: Use the secret (never echoed)
+        env:
+          SECRET: ${{ steps.conjur.outputs.secret-value }}
+        run: |
+          # Echoing $SECRET would be redacted by the mask anyway, but don't
+          # bait the mask filter. Just show that we got something.
+          if [[ -z "${SECRET}" ]]; then
+            echo "ERROR: empty secret-value output from composite action" >&2
+            exit 1
+          fi
+          echo "Secret retrieved successfully. Length=${#SECRET}"

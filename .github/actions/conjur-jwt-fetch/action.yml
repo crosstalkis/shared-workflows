@@ -1,0 +1,122 @@
+name: 'Conjur JWT Fetch'
+description: >
+  Mints a GitHub Actions OIDC JWT, exchanges it at a Conjur authn-jwt service
+  for a Conjur access token, retrieves a single variable, and emits the value
+  as a step output. All intermediate tokens and the final secret are masked
+  via ::add-mask::. Pure curl, no third-party actions — auditability.
+
+inputs:
+  app-name:
+    description: 'Logical application identity (alpha/beta/gamma/...). Provenance only.'
+    required: true
+  conjur-url:
+    description: 'Conjur API base URL. Default: cluster-internal Service DNS.'
+    required: false
+    default: 'https://conjur-oss.conjur.svc.cluster.local'
+  conjur-account:
+    description: 'Conjur account.'
+    required: false
+    default: 'lab'
+  conjur-service-id:
+    description: 'authn-jwt service id.'
+    required: false
+    default: 'gha'
+  conjur-audience:
+    description: 'aud claim requested from GHA OIDC; must equal Conjur audience var.'
+    required: false
+    default: 'conjur/lab'
+  conjur-ca-cert-path:
+    description: 'PEM CA bundle on the runner. Mounted via runner-pod template volume.'
+    required: false
+    default: '/etc/conjur/ssl/ca.pem'
+  secret-id:
+    description: 'Variable id to retrieve, relative to the account.'
+    required: false
+    default: 'lab/secrets/test-secret'
+
+outputs:
+  secret-value:
+    description: 'The retrieved secret value. Already masked in logs.'
+    value: ${{ steps.fetch.outputs.secret-value }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Mint OIDC JWT, exchange at Conjur, fetch secret
+      id: fetch
+      shell: bash
+      env:
+        APP_NAME: ${{ inputs.app-name }}
+        CONJUR_URL: ${{ inputs.conjur-url }}
+        CONJUR_ACCOUNT: ${{ inputs.conjur-account }}
+        CONJUR_SERVICE_ID: ${{ inputs.conjur-service-id }}
+        CONJUR_AUDIENCE: ${{ inputs.conjur-audience }}
+        CONJUR_CACERT: ${{ inputs.conjur-ca-cert-path }}
+        SECRET_ID: ${{ inputs.secret-id }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::1. Mint GHA OIDC JWT (audience=${CONJUR_AUDIENCE})"
+        : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?caller workflow must set permissions.id-token: write}"
+        : "${ACTIONS_ID_TOKEN_REQUEST_URL:?ACTIONS_ID_TOKEN_REQUEST_URL not set by runner}"
+
+        jwt=$(curl -sSf \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${CONJUR_AUDIENCE}" \
+          | jq -r '.value')
+        if [[ -z "${jwt}" || "${jwt}" == "null" ]]; then
+          echo "ERROR: GHA OIDC token endpoint returned empty/null JWT" >&2
+          exit 1
+        fi
+        echo "::add-mask::${jwt}"
+        # Header is not sensitive — log it for debugging alg/typ/kid.
+        hdr_b64="${jwt%%.*}"
+        # Pad and base64-decode (busybox base64 is fussy about padding).
+        padded="${hdr_b64}$(printf '%*s' $(( (4 - ${#hdr_b64} % 4) % 4 )) '' | tr ' ' '=')"
+        echo "JWT header: $(echo "${padded}" | base64 -d 2>/dev/null || echo '<undecodable>')"
+        echo "::endgroup::"
+
+        echo "::group::2. Exchange JWT at Conjur ${CONJUR_URL}/authn-jwt/${CONJUR_SERVICE_ID}/${CONJUR_ACCOUNT}/authenticate"
+        access_token=$(curl -sSf \
+          --cacert "${CONJUR_CACERT}" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          --data-urlencode "jwt=${jwt}" \
+          "${CONJUR_URL}/authn-jwt/${CONJUR_SERVICE_ID}/${CONJUR_ACCOUNT}/authenticate")
+        if [[ -z "${access_token}" ]]; then
+          echo "ERROR: Conjur authn-jwt returned empty body" >&2
+          exit 1
+        fi
+        echo "::add-mask::${access_token}"
+        echo "Conjur access token received (length=${#access_token})"
+        echo "::endgroup::"
+
+        echo "::group::3. Fetch ${SECRET_ID}"
+        # Conjur expects Authorization: Token token="<base64(access_token_json)>"
+        token_b64=$(printf '%s' "${access_token}" | base64 -w0)
+        echo "::add-mask::${token_b64}"
+
+        # URL-encode the secret id so '/' survives the path segment.
+        # Conjur accepts both encoded and unencoded paths; explicit is safer.
+        secret_id_enc=$(printf '%s' "${SECRET_ID}" | jq -sRr @uri)
+
+        secret_value=$(curl -sSf \
+          --cacert "${CONJUR_CACERT}" \
+          -H "Authorization: Token token=\"${token_b64}\"" \
+          "${CONJUR_URL}/secrets/${CONJUR_ACCOUNT}/variable/${secret_id_enc}")
+        if [[ -z "${secret_value}" ]]; then
+          echo "ERROR: Conjur returned empty value for ${SECRET_ID}" >&2
+          exit 1
+        fi
+        echo "::add-mask::${secret_value}"
+        echo "Secret retrieved (length=${#secret_value})"
+        echo "::endgroup::"
+
+        # Emit as output. The mask is in place so subsequent log echoes will be redacted.
+        {
+          echo "secret-value<<__EOF__"
+          printf '%s' "${secret_value}"
+          echo
+          echo "__EOF__"
+        } >> "${GITHUB_OUTPUT}"
+        echo "OK: app=${APP_NAME} secret=${SECRET_ID} fetched and masked."
