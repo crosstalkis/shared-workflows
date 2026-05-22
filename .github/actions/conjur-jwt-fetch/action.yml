@@ -76,6 +76,52 @@ runs:
         echo "JWT header: $(echo "${padded}" | base64 -d 2>/dev/null || echo '<undecodable>')"
         echo "::endgroup::"
 
+        # ---- Remediation 2a: CORRELATION emit (permanent) ----
+        # Parse join-key fields from the JWT *payload* (not from $GITHUB_*)
+        # so the value here is provably the same value Conjur received in
+        # the same token. Plain echo, no ::group::, no ::add-mask:: —
+        # these are join keys, not secrets. grep target: CORRELATION run_id=
+        payload_b64="${jwt#*.}"
+        payload_b64="${payload_b64%%.*}"
+        b64="${payload_b64//-/+}"
+        b64="${b64//_/\/}"
+        pad=$(( (4 - ${#b64} % 4) % 4 ))
+        b64="${b64}$(printf '%*s' "${pad}" '' | tr ' ' '=')"
+        if ! payload_json=$(printf '%s' "${b64}" | base64 -d 2>/dev/null); then
+          echo "ERROR (R2a): could not base64url-decode JWT payload — refusing to silently drop audit correlation line" >&2
+          exit 1
+        fi
+        if [[ -z "${payload_json}" ]]; then
+          echo "ERROR (R2a): empty JWT payload after decode" >&2
+          exit 1
+        fi
+        missing=$(jq -r '["run_id","run_attempt","run_number","repository","repository_id"] - [keys[]] | join(",")' <<< "${payload_json}")
+        if [[ -n "${missing}" ]]; then
+          echo "ERROR (R2a): JWT payload missing required correlation claims: ${missing}" >&2
+          exit 1
+        fi
+        if ! jq -e '
+          (.run_id          | type != "null" and tostring | length > 0) and
+          (.run_attempt     | type != "null" and tostring | length > 0) and
+          (.run_number      | type != "null" and tostring | length > 0) and
+          (.repository      | type == "string" and length > 0) and
+          (.repository_id   | type != "null" and tostring | length > 0)
+        ' <<< "${payload_json}" > /dev/null; then
+          echo "ERROR (R2a): JWT payload has null/empty values among required correlation claims — refusing to emit a degraded CORRELATION line" >&2
+          jq -r '{run_id, run_attempt, run_number, repository, repository_id}' <<< "${payload_json}" >&2 || true
+          exit 1
+        fi
+
+        # --- DEBUG_SUB (TRANSIENT — see Remediation 2a runbook) ---
+        # Echoes the sub claim verbatim so BEFORE/AFTER captures come from
+        # the exact release.yml mint path Conjur consumes. Remove this
+        # block after the AFTER capture is in the notebook, then re-tag v1.
+        jq -r '"DEBUG_SUB \(.sub)"' <<< "${payload_json}"
+        # --- end DEBUG_SUB ---
+
+        jq -r '"CORRELATION run_id=\(.run_id) run_attempt=\(.run_attempt) run_number=\(.run_number) repository=\(.repository) repository_id=\(.repository_id)"' <<< "${payload_json}"
+        # ---- end Remediation 2a ----
+
         echo "::group::2. Exchange JWT at Conjur ${CONJUR_URL}/authn-jwt/${CONJUR_SERVICE_ID}/${CONJUR_ACCOUNT}/authenticate"
         access_token=$(curl -sSf \
           --cacert "${CONJUR_CACERT}" \
