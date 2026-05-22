@@ -110,13 +110,6 @@ runs:
           exit 1
         fi
 
-        # --- DEBUG_SUB (TRANSIENT — see Remediation 2a runbook) ---
-        # Echoes the sub claim verbatim so BEFORE/AFTER captures come from
-        # the exact release.yml mint path Conjur consumes. Remove this
-        # block after the AFTER capture is in the notebook, then re-tag v1.
-        jq -r '"DEBUG_SUB \(.sub)"' <<< "${payload_json}"
-        # --- end DEBUG_SUB ---
-
         jq -r '"CORRELATION run_id=\(.run_id) run_attempt=\(.run_attempt) run_number=\(.run_number) repository=\(.repository) repository_id=\(.repository_id)"' <<< "${payload_json}"
         # ---- end Remediation 2a ----
 
