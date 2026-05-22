@@ -11,19 +11,36 @@ name: Conjur fetch (reusable)
 #       with:
 #         app-name: alpha
 #
-# Phase-3 identity model (post org-level OIDC sub customization):
+# Phase-4 identity model (R1 — per-repo entitlement):
 #
-#   - sub          = job_workflow_ref:crosstalkis/shared-workflows/...@refs/tags/v1
-#                    (same for every caller — the org-wide template drops the
-#                    repo identifier from sub)
-#   - environment  = <app-name> (alpha/beta/gamma/rogue) — set on this job,
-#                    bubbles into the JWT as the `environment` claim
-#   - repository   = <caller repo> (still per-caller, used for evidence trail)
+#   - The JWT's `repository` claim (set by GitHub at mint time, NOT
+#     influenced by anything in this workflow) is what Conjur uses for
+#     host lookup. Conjur config:
+#       token-app-property = repository
+#       identity-path      = repos
+#     Host id resolved at authn time: host/repos/crosstalkis/<repo>.
+#   - `app-name` is still an input, but it ONLY drives the secret-path
+#     default (apps/<app-name>/secrets/db-password). It is no longer
+#     the identity carrier. Calling with app-name: beta from a repo
+#     that is not a member of the apps/beta layer in Conjur will FAIL
+#     at the secret fetch step (403), not at authn (which succeeds for
+#     the repo's own host).
+#   - Authorization: per-repo hosts are granted into app-layer
+#     membership in Conjur policy 25-grants.yml. Layer permits on
+#     apps/<name>/secrets/db-password cascade to layer members.
+#   - Defense in depth (kept): host annotations pin job_workflow_ref
+#     to the trusted reusable @v1 (tag mutability remains a separate
+#     gap — R3 in the queue, so @v1 is the trust pin, not yet an
+#     immutable trust anchor) and repository_owner to crosstalkis.
+#     Phase 4 adds repository + repository_id pins on top. A forged
+#     JWT with the wrong repo claim fails annotation match. A
+#     rename-to-impersonate breaks at the repository_id pin.
 #
-# Conjur uses the `environment` claim as the per-app handle (token-app-property)
-# and validates `job_workflow_ref` matches the trusted reusable as defense-
-# in-depth annotation. Three repos with app-name=beta all authenticate as
-# the same Conjur host apps/beta even though their repository claims differ.
+# Phase-3 history: this workflow USED to set
+# `environment: ${{ inputs.app-name }}` on the fetch job, and Conjur
+# USED `environment` as the lookup key. That made the identity
+# caller-controlled (app-alpha could pass app-name: beta and authenticate
+# as apps/beta). R1 closes that gap.
 
 on:
   workflow_call:
@@ -31,7 +48,10 @@ on:
       app-name:
         type: string
         required: true
-        description: 'Logical application identity (alpha/beta/gamma/rogue).'
+        description: >
+          Logical application identity (alpha/beta/gamma/rogue). Drives
+          the default secret path only. NOT the authn identity carrier
+          since Phase 4.
       conjur-url:
         type: string
         required: false
@@ -53,39 +73,32 @@ on:
         required: false
         description: >
           Override the secret path. Default derives from app-name:
-          apps/<app-name>/secrets/db-password. Callers that need a different
-          secret can pass this explicitly.
+          apps/<app-name>/secrets/db-password. Callers asking for
+          another app's secret will get 403 — see Phase 4 T2 in
+          conjur-2026-05-16.md.
         default: ''
 
 jobs:
   fetch:
-    # Matches the gha-runner-scale-set name installed in arc-runners ns.
     runs-on: lab-runners
-
-    # Environment derived from app-name. This is the Phase 3 lever — the
-    # GHA OIDC token's `environment` claim becomes the per-app workload
-    # identity that Conjur uses for host lookup (token-app-property=environment,
-    # identity-path=apps). Three caller repos sharing app-name=beta all
-    # authenticate as the same Conjur host (apps/beta) even though their
-    # `repository` claims differ.
-    environment: ${{ inputs.app-name }}
-
+    # NOTE: no `environment:` here. Phase 4 removed it. Identity is
+    # carried by the `repository` claim now, which GitHub sets at
+    # JWT-mint time without any input from this workflow.
     permissions:
-      id-token: write    # required so the runner exposes ACTIONS_ID_TOKEN_REQUEST_*
+      id-token: write
       contents: read
     steps:
       - name: Run context
         run: |
-          echo "App identity (logical, from caller): ${{ inputs.app-name }}"
-          echo "Caller repo (OIDC sub will reflect this): ${{ github.repository }}"
-          echo "Caller ref:  ${{ github.ref }}"
-          echo "Conjur URL:  ${{ inputs.conjur-url }}"
-          echo "Secret id:   ${{ inputs.secret-id }}"
+          echo "App input (drives secret path only): ${{ inputs.app-name }}"
+          echo "Caller repo (Conjur identity):       ${{ github.repository }}"
+          echo "Caller ref:                          ${{ github.ref }}"
+          echo "Conjur URL:                          ${{ inputs.conjur-url }}"
+          echo "Secret id:                           ${{ inputs.secret-id }}"
 
       - name: Resolve secret-id
         id: resolve
         run: |
-          # Caller override wins; otherwise derive apps/<app-name>/secrets/db-password.
           if [[ -n "${{ inputs.secret-id }}" ]]; then
             echo "secret-id=${{ inputs.secret-id }}" >> "$GITHUB_OUTPUT"
           else
@@ -94,9 +107,6 @@ jobs:
 
       - name: Conjur JWT exchange + secret fetch
         id: conjur
-        # Pinned by tag — same as the reusable workflow ref. v1 moves only on
-        # intentional release. Bumping shared-workflows version is a deliberate
-        # rollout decision (matches how this'd work in ČSAS).
         uses: crosstalkis/shared-workflows/.github/actions/conjur-jwt-fetch@v1
         with:
           app-name: ${{ inputs.app-name }}
@@ -110,8 +120,6 @@ jobs:
         env:
           SECRET: ${{ steps.conjur.outputs.secret-value }}
         run: |
-          # Echoing $SECRET would be redacted by the mask anyway, but don't
-          # bait the mask filter. Just show that we got something.
           if [[ -z "${SECRET}" ]]; then
             echo "ERROR: empty secret-value output from composite action" >&2
             exit 1
