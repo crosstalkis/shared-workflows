@@ -101,11 +101,9 @@ runs:
           exit 1
         fi
         if ! jq -e '
-          (.run_id          | type != "null" and tostring | length > 0) and
-          (.run_attempt     | type != "null" and tostring | length > 0) and
-          (.run_number      | type != "null" and tostring | length > 0) and
-          (.repository      | type == "string" and length > 0) and
-          (.repository_id   | type != "null" and tostring | length > 0)
+          [.run_id, .run_attempt, .run_number, .repository, .repository_id]
+          | map(. != null and (tostring | length) > 0)
+          | all
         ' <<< "${payload_json}" > /dev/null; then
           echo "ERROR (R2a): JWT payload has null/empty values among required correlation claims — refusing to emit a degraded CORRELATION line" >&2
           jq -r '{run_id, run_attempt, run_number, repository, repository_id}' <<< "${payload_json}" >&2 || true
