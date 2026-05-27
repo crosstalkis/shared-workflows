@@ -1,0 +1,84 @@
+name: SoD test — cross-boundary authZ
+
+# Reusable SoD test harness. Authenticates as the given host, then
+# attempts to fetch a secret. Asserts exact expected HTTP status.
+
+on:
+  workflow_call:
+    inputs:
+      host-id:
+        type: string
+        required: true
+      secret-path:
+        type: string
+        required: true
+      expected-fetch-status:
+        type: string
+        required: true
+        description: 'Expected HTTP status code for the secret fetch (200, 403, etc.)'
+      environment:
+        type: string
+        required: true
+      conjur-url:
+        type: string
+        required: false
+        default: 'https://conjur-oss.conjur.svc.cluster.local'
+      conjur-account:
+        type: string
+        required: false
+        default: 'lab'
+
+jobs:
+  test:
+    runs-on: lab-runners
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: "AuthZ test: host/${{ inputs.host-id }} -> ${{ inputs.secret-path }} (expect ${{ inputs.expected-fetch-status }})"
+        shell: bash
+        env:
+          CONJUR_CACERT: /etc/conjur/ssl/ca.pem
+        run: |
+          set -euo pipefail
+
+          jwt=$(curl -sSf \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=conjur/lab" \
+            | jq -r '.value')
+          echo "::add-mask::${jwt}"
+
+          host_encoded=$(printf '%s' "host/${{ inputs.host-id }}" | jq -sRr @uri)
+
+          http_auth=$(curl -sS -o /tmp/auth -w '%{http_code}' \
+            --cacert "${CONJUR_CACERT}" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "jwt=${jwt}" \
+            "${{ inputs.conjur-url }}/authn-jwt/gha-v2/${{ inputs.conjur-account }}/${host_encoded}/authenticate")
+
+          if [[ "${http_auth}" != "200" ]]; then
+            echo "::error::AuthN failed (HTTP ${http_auth}) for host/${{ inputs.host-id }}"
+            cat /tmp/auth >&2
+            exit 1
+          fi
+          echo "Authenticated as host/${{ inputs.host-id }}"
+
+          access_token=$(cat /tmp/auth)
+          echo "::add-mask::${access_token}"
+          token_b64=$(printf '%s' "${access_token}" | base64 -w0)
+          echo "::add-mask::${token_b64}"
+
+          var_encoded=$(printf '%s' "${{ inputs.secret-path }}" | jq -sRr @uri)
+          http_fetch=$(curl -sS -o /tmp/secret -w '%{http_code}' \
+            --cacert "${CONJUR_CACERT}" \
+            -H "Authorization: Token token=\"${token_b64}\"" \
+            "${{ inputs.conjur-url }}/secrets/${{ inputs.conjur-account }}/variable/${var_encoded}")
+
+          if [[ "${http_fetch}" == "${{ inputs.expected-fetch-status }}" ]]; then
+            echo "PASS — Fetch returned ${{ inputs.expected-fetch-status }} as expected"
+          else
+            echo "::error::FAIL — Expected ${{ inputs.expected-fetch-status }}, got ${http_fetch}"
+            exit 1
+          fi

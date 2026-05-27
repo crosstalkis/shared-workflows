@@ -1,0 +1,87 @@
+name: Conjur fetch v2 (per-app-env)
+
+# Phase-5 reusable workflow. Callers invoke via:
+#
+#   jobs:
+#     release:
+#       uses: crosstalkis/shared-workflows/.github/workflows/conjur-fetch-v2.yml@v2
+#       permissions:
+#         id-token: write
+#         contents: read
+#       with:
+#         host-id: alpha/alpha-prod
+#         environment: prod
+#         secrets: |
+#           alpha/prod/db-password
+#
+# Identity model: per-app-env. The host-id input determines which Conjur
+# host to authenticate as. Conjur validates JWT claims (repository,
+# environment, ref, job_workflow_ref) against host annotations. Uses
+# authn-jwt/gha-v2 — no token-app-property, identity is explicit.
+
+on:
+  workflow_call:
+    inputs:
+      host-id:
+        type: string
+        required: true
+        description: 'Conjur host identity (e.g., alpha/alpha-prod)'
+      secrets:
+        type: string
+        required: true
+        description: 'Secret variable paths, one per line'
+      environment:
+        type: string
+        required: true
+        description: 'GitHub Environment name (prod/dev). Sets the environment claim in the JWT.'
+      conjur-url:
+        type: string
+        required: false
+        default: 'https://conjur-oss.conjur.svc.cluster.local'
+      conjur-account:
+        type: string
+        required: false
+        default: 'lab'
+      conjur-service-id:
+        type: string
+        required: false
+        default: 'gha-v2'
+      conjur-audience:
+        type: string
+        required: false
+        default: 'conjur/lab'
+
+jobs:
+  fetch:
+    runs-on: lab-runners
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Run context
+        run: |
+          echo "Host-id:     ${{ inputs.host-id }}"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Caller repo: ${{ github.repository }}"
+          echo "Caller ref:  ${{ github.ref }}"
+
+      - name: Fetch secrets from Conjur
+        id: conjur
+        uses: crosstalkis/shared-workflows/.github/actions/conjur-jwt-fetch-v2@v2
+        with:
+          host-id: ${{ inputs.host-id }}
+          secrets: ${{ inputs.secrets }}
+          conjur-url: ${{ inputs.conjur-url }}
+          conjur-account: ${{ inputs.conjur-account }}
+          conjur-service-id: ${{ inputs.conjur-service-id }}
+          conjur-audience: ${{ inputs.conjur-audience }}
+
+      - name: Confirm secrets loaded
+        env:
+          FIRST_SECRET: ${{ steps.conjur.outputs.secret-value }}
+        run: |
+          if [[ -z "${FIRST_SECRET}" ]]; then
+            echo "ERROR: empty secret-value output" >&2; exit 1
+          fi
+          echo "Secret retrieved (length=${#FIRST_SECRET})"

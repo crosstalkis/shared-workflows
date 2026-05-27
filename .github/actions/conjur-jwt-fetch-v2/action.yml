@@ -1,0 +1,164 @@
+name: 'Conjur JWT Fetch v2 (per-app-env)'
+description: >
+  Phase-5 identity model: per-app-env hosts with explicit host-id in the
+  authn URL. Uses authn-jwt/gha-v2 (no token-app-property). Mints a
+  GitHub OIDC JWT, authenticates as the specified host, fetches secrets,
+  and emits values as masked outputs/env vars. Pure curl — no third-party
+  actions.
+
+inputs:
+  host-id:
+    description: 'Conjur host identity (e.g., alpha/alpha-prod). Passed in authn URL.'
+    required: true
+  secrets:
+    description: >
+      Secret variable paths to fetch, one per line. Each is fetched and
+      exported as a masked env var (last segment, uppercased, hyphens to
+      underscores). Also emitted as step outputs keyed by sanitized name.
+    required: true
+  conjur-url:
+    description: 'Conjur API base URL.'
+    required: false
+    default: 'https://conjur-oss.conjur.svc.cluster.local'
+  conjur-account:
+    description: 'Conjur account.'
+    required: false
+    default: 'lab'
+  conjur-service-id:
+    description: 'authn-jwt service id.'
+    required: false
+    default: 'gha-v2'
+  conjur-audience:
+    description: 'aud claim requested from GHA OIDC.'
+    required: false
+    default: 'conjur/lab'
+  conjur-ca-cert-path:
+    description: 'PEM CA bundle on the runner.'
+    required: false
+    default: '/etc/conjur/ssl/ca.pem'
+
+outputs:
+  secret-value:
+    description: 'Value of the first secret fetched (for single-secret callers).'
+    value: ${{ steps.fetch.outputs.secret-value }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Authenticate and fetch secrets
+      id: fetch
+      shell: bash
+      env:
+        INPUT_HOST_ID: ${{ inputs.host-id }}
+        INPUT_SECRETS: ${{ inputs.secrets }}
+        CONJUR_URL: ${{ inputs.conjur-url }}
+        CONJUR_ACCOUNT: ${{ inputs.conjur-account }}
+        CONJUR_SERVICE_ID: ${{ inputs.conjur-service-id }}
+        CONJUR_AUDIENCE: ${{ inputs.conjur-audience }}
+        CONJUR_CACERT: ${{ inputs.conjur-ca-cert-path }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::1. Mint GHA OIDC JWT (audience=${CONJUR_AUDIENCE})"
+        : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?caller must set permissions.id-token: write}"
+        : "${ACTIONS_ID_TOKEN_REQUEST_URL:?ACTIONS_ID_TOKEN_REQUEST_URL not set}"
+
+        jwt=$(curl -sSf \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${CONJUR_AUDIENCE}" \
+          | jq -r '.value')
+        if [[ -z "${jwt}" || "${jwt}" == "null" ]]; then
+          echo "ERROR: OIDC token endpoint returned empty/null JWT" >&2; exit 1
+        fi
+        echo "::add-mask::${jwt}"
+
+        hdr_b64="${jwt%%.*}"
+        padded="${hdr_b64}$(printf '%*s' $(( (4 - ${#hdr_b64} % 4) % 4 )) '' | tr ' ' '=')"
+        echo "JWT header: $(echo "${padded}" | base64 -d 2>/dev/null || echo '<undecodable>')"
+
+        # CORRELATION emit
+        payload_b64="${jwt#*.}"; payload_b64="${payload_b64%%.*}"
+        b64="${payload_b64//-/+}"; b64="${b64//_/\/}"
+        pad=$(( (4 - ${#b64} % 4) % 4 ))
+        b64="${b64}$(printf '%*s' "${pad}" '' | tr ' ' '=')"
+        payload_json=$(printf '%s' "${b64}" | base64 -d 2>/dev/null) || { echo "ERROR: JWT decode failed" >&2; exit 1; }
+        jq -r '"CORRELATION run_id=\(.run_id) run_attempt=\(.run_attempt) repository=\(.repository) environment=\(.environment // "none")"' <<< "${payload_json}"
+        echo "::endgroup::"
+
+        echo "::group::2. Authenticate as host/${INPUT_HOST_ID} via authn-jwt/${CONJUR_SERVICE_ID}"
+        host_encoded=$(printf '%s' "host/${INPUT_HOST_ID}" | jq -sRr @uri)
+
+        http_code=$(curl -sS -o /tmp/_conjur_auth -w '%{http_code}' \
+          --cacert "${CONJUR_CACERT}" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          --data-urlencode "jwt=${jwt}" \
+          "${CONJUR_URL}/authn-jwt/${CONJUR_SERVICE_ID}/${CONJUR_ACCOUNT}/${host_encoded}/authenticate")
+
+        if [[ "${http_code}" != "200" ]]; then
+          echo "ERROR: Conjur authn failed (HTTP ${http_code}) for host/${INPUT_HOST_ID}" >&2
+          cat /tmp/_conjur_auth >&2
+          rm -f /tmp/_conjur_auth
+          exit 1
+        fi
+
+        access_token=$(cat /tmp/_conjur_auth); rm -f /tmp/_conjur_auth
+        echo "::add-mask::${access_token}"
+        token_b64=$(printf '%s' "${access_token}" | base64 -w0)
+        echo "::add-mask::${token_b64}"
+        echo "Authenticated (token length=${#access_token})"
+        echo "::endgroup::"
+
+        echo "::group::3. Fetch secrets"
+        fetch_count=0; fail_count=0; first_value=""
+
+        while IFS= read -r secret_path; do
+          secret_path="${secret_path#"${secret_path%%[![:space:]]*}"}"
+          secret_path="${secret_path%"${secret_path##*[![:space:]]}"}"
+          [[ -z "${secret_path}" ]] && continue
+
+          secret_id_enc=$(printf '%s' "${secret_path}" | jq -sRr @uri)
+
+          http_code=$(curl -sS -o /tmp/_conjur_secret -w '%{http_code}' \
+            --cacert "${CONJUR_CACERT}" \
+            -H "Authorization: Token token=\"${token_b64}\"" \
+            "${CONJUR_URL}/secrets/${CONJUR_ACCOUNT}/variable/${secret_id_enc}")
+
+          if [[ "${http_code}" != "200" ]]; then
+            echo "::error::Failed to fetch ${secret_path} (HTTP ${http_code})"
+            rm -f /tmp/_conjur_secret
+            fail_count=$((fail_count + 1))
+            continue
+          fi
+
+          secret_value=$(cat /tmp/_conjur_secret); rm -f /tmp/_conjur_secret
+          echo "::add-mask::${secret_value}"
+
+          var_name=$(echo "${secret_path}" | rev | cut -d'/' -f1 | rev | tr '[:lower:]-' '[:upper:]_')
+
+          delimiter=$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          {
+            echo "${var_name}<<${delimiter}"
+            printf '%s' "${secret_value}"
+            echo
+            echo "${delimiter}"
+          } >> "${GITHUB_ENV}"
+
+          echo "Fetched ${secret_path} -> \$${var_name}"
+          [[ ${fetch_count} -eq 0 ]] && first_value="${secret_value}"
+          fetch_count=$((fetch_count + 1))
+        done <<< "${INPUT_SECRETS}"
+
+        echo "Fetched ${fetch_count} secret(s), ${fail_count} failure(s)"
+        echo "::endgroup::"
+
+        if [[ -n "${first_value}" ]]; then
+          {
+            echo "secret-value<<__EOF__"
+            printf '%s' "${first_value}"
+            echo
+            echo "__EOF__"
+          } >> "${GITHUB_OUTPUT}"
+        fi
+
+        if [[ "${fail_count}" -gt 0 ]]; then exit 1; fi
