@@ -1,0 +1,52 @@
+name: conjur-fetch-v4
+
+# Golden-path reusable for the v4 safe-topology harness.
+#
+# A caller in an OPS repo invokes this reusable; the resulting job's OIDC
+# token carries job_workflow_ref =
+#   crosstalkis/shared-workflows/.github/workflows/conjur-fetch-v4.yml@refs/tags/v4
+# which is exactly what the `ops-prod-golden` host pins. So authenticating as
+# the golden host SUCCEEDS only through this workflow (T-6 positive). A direct
+# workflow in the same repo authenticating as the golden host fails the
+# job_workflow_ref annotation (T-6 negative, driven by tm-ops.yml).
+#
+# Tag this file's repo at `v4` after pushing:
+#   git tag -f v4 && git push -f origin v4
+# (lab force-retag convention, same as v1/v2 — see walkthrough.md.)
+
+on:
+  workflow_call:
+    inputs:
+      host-id:
+        description: 'Conjur host (no host/ prefix), e.g. sas-topo/sas-beta/ops-prod-golden'
+        required: true
+        type: string
+      secret-id:
+        required: true
+        type: string
+      expect-prefix:
+        required: true
+        type: string
+      environment:
+        description: 'GHA environment to run under (drives the environment claim).'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: lab-runners
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Golden-path fetch via gha-v4
+        uses: crosstalkis/shared-workflows/.github/actions/tm-conjur-attempt@v4
+        with:
+          host-id: ${{ inputs.host-id }}
+          expect-code: '200'
+          secret-id: ${{ inputs.secret-id }}
+          expect-prefix: ${{ inputs.expect-prefix }}
+          label: golden-path

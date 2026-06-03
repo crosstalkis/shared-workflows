@@ -1,0 +1,147 @@
+name: 'TM Conjur Attempt'
+description: >
+  Threat-model harness primitive. Mints a GHA OIDC JWT for the gha-v4
+  audience, prints its segregation-relevant claims for evidence, then ATTEMPTS
+  to authenticate as a named Conjur host (URL host-id) and asserts the HTTP
+  status equals the expected code. For positive cases (expect-code=200) it
+  optionally fetches the host's secret and verifies the value prefix, proving
+  it routed to the RIGHT safe.
+
+  Used by the tm-* workflows to drive T-1/T-2/T-4/T-6(b)/T-7 and the positives.
+  Lab-only diagnostic — never copy into a production caller.
+
+inputs:
+  host-id:
+    description: 'Conjur host resource id WITHOUT the host/ kind prefix, e.g. sas-topo/sas-beta/ops-prod'
+    required: true
+  expect-code:
+    description: 'Expected HTTP status from the authenticate call (e.g. 200, 401).'
+    required: true
+  expect-prefix:
+    description: 'For positive (200) cases: the secret value prefix that proves correct routing. Empty to skip the fetch.'
+    required: false
+    default: ''
+  secret-id:
+    description: 'For positive cases: the variable id to fetch, e.g. sas-topo/sas-beta/ops-prod/secret.'
+    required: false
+    default: ''
+  audience:
+    description: 'aud claim requested; must equal the gha-v4 audience var.'
+    required: false
+    default: 'conjur/lab/topo'
+  conjur-url:
+    required: false
+    default: 'https://conjur-oss.conjur.svc.cluster.local'
+  conjur-account:
+    required: false
+    default: 'lab'
+  conjur-service-id:
+    required: false
+    default: 'gha-v4'
+  conjur-ca-cert-path:
+    required: false
+    default: '/etc/conjur/ssl/ca.pem'
+  label:
+    description: 'Free-text label for the greppable result line.'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Mint JWT, print claims, attempt auth, assert
+      shell: bash
+      env:
+        HOST_ID: ${{ inputs.host-id }}
+        EXPECT_CODE: ${{ inputs.expect-code }}
+        EXPECT_PREFIX: ${{ inputs.expect-prefix }}
+        SECRET_ID: ${{ inputs.secret-id }}
+        AUDIENCE: ${{ inputs.audience }}
+        CONJUR_URL: ${{ inputs.conjur-url }}
+        CONJUR_ACCOUNT: ${{ inputs.conjur-account }}
+        CONJUR_SERVICE_ID: ${{ inputs.conjur-service-id }}
+        CONJUR_CACERT: ${{ inputs.conjur-ca-cert-path }}
+        LABEL: ${{ inputs.label }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::1. Mint GHA OIDC JWT (audience=${AUDIENCE})"
+        : "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:?caller must set permissions.id-token: write}"
+        : "${ACTIONS_ID_TOKEN_REQUEST_URL:?runner did not set request URL}"
+        jwt=$(curl -sSf \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r '.value')
+        if [[ -z "${jwt}" || "${jwt}" == "null" ]]; then
+          echo "ERROR: empty/null JWT" >&2; exit 1
+        fi
+        echo "::add-mask::${jwt}"
+        echo "JWT minted (length=${#jwt})"
+        echo "::endgroup::"
+
+        # Decode payload (base64url) — same handling as inspect-jwt / verify-v3.
+        payload_b64="${jwt#*.}"; payload_b64="${payload_b64%%.*}"
+        b64="${payload_b64//-/+}"; b64="${b64//_/\/}"
+        pad=$(( (4 - ${#b64} % 4) % 4 ))
+        b64="${b64}$(printf '%*s' "${pad}" '' | tr ' ' '=')"
+        payload_json=$(printf '%s' "${b64}" | base64 -d 2>/dev/null)
+
+        echo "::group::2. Segregation-relevant claims (evidence)"
+        # These are identity data, not secrets — print verbatim for the lab note.
+        jq -r '
+          "repo_property_sas_id   = \(.repo_property_sas_id   // "<absent>")",
+          "repo_property_repo_type = \(.repo_property_repo_type // "<absent>")",
+          "environment            = \(.environment            // "<absent>")",
+          "job_workflow_ref       = \(.job_workflow_ref       // "<absent>")",
+          "repository             = \(.repository             // "<absent>")",
+          "repository_owner       = \(.repository_owner       // "<absent>")",
+          "iat                    = \(.iat)   exp = \(.exp)"
+        ' <<< "${payload_json}"
+        echo "::endgroup::"
+
+        echo "::group::3. Attempt authn as host/${HOST_ID} (expect HTTP ${EXPECT_CODE})"
+        login_enc=$(printf 'host/%s' "${HOST_ID}" | jq -sRr @uri)
+        http_code=$(curl -sS -o /tmp/tm-auth -w '%{http_code}' \
+          --cacert "${CONJUR_CACERT}" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          --data-urlencode "jwt=${jwt}" \
+          "${CONJUR_URL}/authn-jwt/${CONJUR_SERVICE_ID}/${CONJUR_ACCOUNT}/${login_enc}/authenticate")
+        echo "authenticate -> HTTP ${http_code}"
+        echo "::endgroup::"
+
+        verdict="PASS"
+        if [[ "${http_code}" != "${EXPECT_CODE}" ]]; then
+          verdict="FAIL"
+        fi
+
+        # Positive path: prove correct routing by fetching the secret + prefix check.
+        secret_check="(skipped)"
+        if [[ "${http_code}" == "200" && -n "${EXPECT_PREFIX}" && -n "${SECRET_ID}" ]]; then
+          echo "::group::4. Fetch ${SECRET_ID} and verify prefix"
+          access_token=$(cat /tmp/tm-auth)
+          echo "::add-mask::${access_token}"
+          token_b64=$(printf '%s' "${access_token}" | base64 -w0)
+          echo "::add-mask::${token_b64}"
+          secret_enc=$(printf '%s' "${SECRET_ID}" | jq -sRr @uri)
+          secret_value=$(curl -sSf --cacert "${CONJUR_CACERT}" \
+            -H "Authorization: Token token=\"${token_b64}\"" \
+            "${CONJUR_URL}/secrets/${CONJUR_ACCOUNT}/variable/${secret_enc}")
+          echo "::add-mask::${secret_value}"
+          if [[ "${secret_value}" == ${EXPECT_PREFIX}* ]]; then
+            secret_check="MATCH"
+          else
+            secret_check="MISMATCH"; verdict="FAIL"
+          fi
+          echo "secret prefix check: ${secret_check}"
+          echo "::endgroup::"
+        fi
+
+        # Greppable result line for the evidence capture.
+        echo "TM_RESULT label=${LABEL:-none} host=${HOST_ID} expected=${EXPECT_CODE} got=${http_code} secret=${secret_check} verdict=${verdict}"
+
+        if [[ "${verdict}" != "PASS" ]]; then
+          echo "::error::TM attempt did not match expectation (host=${HOST_ID} expected=${EXPECT_CODE} got=${http_code} secret=${secret_check})"
+          echo "----- Conjur response body -----" >&2
+          cat /tmp/tm-auth >&2 || true
+          exit 1
+        fi
