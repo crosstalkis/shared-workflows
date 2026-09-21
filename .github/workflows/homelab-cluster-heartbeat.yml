@@ -6,10 +6,16 @@ name: Homelab cluster heartbeat
 # (`runs-on: lab-runners`), which existed to serve the Conjur secrets lab. ARC was
 # retired on 2026-09-21 along with the lab, so this now runs on a GitHub-hosted
 # runner and proves the same thing a different way: an outside observer can reach
-# a public homelab endpoint through Cloudflare Tunnel into the cluster.
+# an in-cluster service through Cloudflare Tunnel and Traefik.
 #
-# It is a liveness signal, not a correctness check. A failure here means either
-# the cluster is unreachable from the internet or Cloudflare/Traefik is degraded.
+# Target choice: notes.crosstalkis.com serves Quartz from the `knowledge`
+# namespace. The Authelia forward-auth redirect (302) is issued before CrowdSec
+# evaluates the client, so this endpoint answers consistently from a datacenter IP.
+# phonebook.crosstalkis.com was tried first and returned 403 from GitHub runner
+# range because CrowdSec blocks it - a working control, but useless as a probe.
+#
+# This is a liveness signal, not a correctness check. A failure means the cluster
+# is unreachable from the internet, or Cloudflare/Traefik/Authelia is degraded.
 
 on:
   schedule:
@@ -32,11 +38,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          target="https://phonebook.crosstalkis.com/"
+          target="https://notes.crosstalkis.com/"
           code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 --retry 2 "$target")
           printf 'Homelab cluster heartbeat at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           printf 'Target: %s -> HTTP %s\n' "$target" "$code"
-          if [ "$code" != "200" ]; then
-            echo "::error::Homelab endpoint returned HTTP $code, expected 200"
-            exit 1
-          fi
+          # 200 = page served, 302 = Authelia forward-auth redirect. Both prove the
+          # request traversed Cloudflare into the cluster and reached a real backend.
+          case "$code" in
+            200|302) exit 0 ;;
+            *)
+              echo "::error::Homelab endpoint returned HTTP $code, expected 200 or 302"
+              exit 1
+              ;;
+          esac
